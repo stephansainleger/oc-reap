@@ -1,0 +1,153 @@
+{
+ "info": {
+  "id": "ses_0NvmdkqS2zfNvXby06SMWsIeYk",
+  "slug": "kind-engine",
+  "projectID": "global",
+  "directory": "/tmp/oc-reap-fixture",
+  "path": "",
+  "title": "oc-reap fixture",
+  "agent": "build",
+  "model": {
+   "id": "claude-haiku-5-5",
+   "providerID": "anthropic",
+   "variant": "default"
+  },
+  "version": "1.19.3",
+  "summary": {
+   "additions": 0,
+   "deletions": 0,
+   "files": 0
+  },
+  "cost": 0.00034339,
+  "tokens": {
+   "input": 4,
+   "output": 4,
+   "reasoning": 0,
+   "cache": {
+    "read": 34099,
+    "write": 0
+   }
+  },
+  "permission": [
+   {
+    "permission": "question",
+    "pattern": "*",
+    "action": "deny"
+   },
+   {
+    "permission": "plan_enter",
+    "pattern": "*",
+    "action": "deny"
+   },
+   {
+    "permission": "plan_exit",
+    "pattern": "*",
+    "action": "deny"
+   }
+  ],
+  "time": {
+   "created": 1792618673914,
+   "updated": 1792618676961
+  }
+ },
+ "messages": [
+  {
+   "info": {
+    "role": "user",
+    "time": {
+     "created": 1792618674001
+    },
+    "agent": "build",
+    "model": {
+     "providerID": "anthropic",
+     "modelID": "claude-haiku-5-5"
+    },
+    "summary": {
+     "diffs": []
+    },
+    "id": "msg_0H22Z3WMhWSRTk35ZAcB5S8PRD",
+    "sessionID": "ses_0NvmdkqS2zfNvXby06SMWsIeYk"
+   },
+   "parts": [
+    {
+     "type": "text",
+     "text": "\"reply with the single word OK\"",
+     "id": "prt_0esNQLNMQPKBZ0Rm5ckBDiuxxf",
+     "sessionID": "ses_0NvmdkqS2zfNvXby06SMWsIeYk",
+     "messageID": "msg_0H22Z3WMhWSRTk35ZAcB5S8PRD"
+    }
+   ]
+  },
+  {
+   "info": {
+    "parentID": "msg_0H22Z3WMhWSRTk35ZAcB5S8PRD",
+    "role": "assistant",
+    "mode": "build",
+    "agent": "build",
+    "path": {
+     "cwd": "/tmp/oc-reap-fixture",
+     "root": "/tmp/oc-reap-fixture"
+    },
+    "cost": 0.00034339,
+    "tokens": {
+     "total": 34107,
+     "input": 4,
+     "output": 4,
+     "reasoning": 0,
+     "cache": {
+      "write": 0,
+      "read": 34099
+     }
+    },
+    "modelID": "claude-haiku-5-5",
+    "providerID": "anthropic",
+    "time": {
+     "created": 1792618674643,
+     "completed": 1792618676945
+    },
+    "finish": "stop",
+    "id": "msg_0tbFxV599TYrvQrgaAo4To55pe",
+    "sessionID": "ses_0NvmdkqS2zfNvXby06SMWsIeYk"
+   },
+   "parts": [
+    {
+     "snapshot": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+     "type": "step-start",
+     "id": "prt_0qNUWPC9IlMNuYOYOd3bqqLcVT",
+     "sessionID": "ses_0NvmdkqS2zfNvXby06SMWsIeYk",
+     "messageID": "msg_0tbFxV599TYrvQrgaAo4To55pe"
+    },
+    {
+     "type": "text",
+     "text": "OK",
+     "time": {
+      "start": 1792618676878,
+      "end": 1792618676883
+     },
+     "id": "prt_0i05wE8v7bML0Ukq52OAvILk1O",
+     "sessionID": "ses_0NvmdkqS2zfNvXby06SMWsIeYk",
+     "messageID": "msg_0tbFxV599TYrvQrgaAo4To55pe"
+    },
+    {
+     "reason": "stop",
+     "snapshot": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+     "type": "step-finish",
+     "tokens": {
+      "total": 34107,
+      "input": 4,
+      "output": 4,
+      "reasoning": 0,
+      "cache": {
+       "write": 0,
+       "read": 34099
+      }
+     },
+     "cost": 0.00034339,
+     "id": "prt_0UP09FvBCCV4NeMMUCmrKhHGh7",
+     "sessionID": "ses_0NvmdkqS2zfNvXby06SMWsIeYk",
+     "messageID": "msg_0tbFxV599TYrvQrgaAo4To55pe"
+    }
+   ]
+  }
+ ]
+}
