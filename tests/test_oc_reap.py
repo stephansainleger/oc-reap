@@ -3,10 +3,12 @@
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import oc_reap  # noqa: E402
@@ -200,6 +202,105 @@ class PlanTests(unittest.TestCase):
                                 subprocess.CompletedProcess(argv, 1, "", "boom"))
         with self.assertRaises(oc_reap.ReapError):
             db.session("ses_parent1")
+
+
+class FakeApiRunner:
+    """Stand-in for subprocess.run that applies v2 title updates to SQLite."""
+
+    def __init__(self, path):
+        """Keep the DB path and record every API call."""
+        self.path = path
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        """Apply ``api patch`` to the test database; accept other commands."""
+        self.calls.append(argv)
+        if len(argv) > 5 and argv[1:3] == ["api", "patch"]:
+            session_id = argv[3].rsplit("/", 1)[-1]
+            title = json.loads(argv[5])["title"]
+            con = sqlite3.connect(self.path)
+            con.execute("UPDATE session_v2 SET title = ? WHERE id = ?",
+                        (title, session_id))
+            con.commit()
+            con.close()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def v2_store(tmp, rows):
+    """Create a minimal ``session_v2`` database and a V2SessionStore."""
+    path = os.path.join(tmp, "opencode.db")
+    con = sqlite3.connect(path)
+    con.execute("""CREATE TABLE session_v2 (
+        id TEXT PRIMARY KEY, title TEXT, parent_id TEXT, directory TEXT,
+        time_updated INTEGER, time_busy INTEGER, time_viewed INTEGER,
+        time_idle INTEGER)""")
+    for row in rows:
+        con.execute(
+            "INSERT INTO session_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (row["id"], row["title"], row.get("parent_id"), row["directory"],
+             row.get("time_updated"), row.get("time_busy"),
+             row.get("time_viewed"), row.get("time_idle")))
+    con.commit()
+    con.close()
+    return oc_reap.V2SessionStore("opencode", runner=FakeApiRunner(path),
+                                  db_path=path)
+
+
+class V2PlanTests(unittest.TestCase):
+    """OpenCode 2 session matching and activity."""
+
+    def setUp(self):
+        """Build a parent/child session pair with old activity."""
+        self.tmp = tempfile.mkdtemp(prefix="oc-reap-v2-")
+        self.addCleanup(self._cleanup)
+        old = int(epoch("2026-10-20T15:00:01.000") * 1000)
+        self.store = v2_store(self.tmp, [
+            {"id": "ses_parent1", "title": "Migrate module", "directory": "/home/u/dev/proj",
+             "time_updated": old},
+            {"id": "ses_child1", "title": "Explore", "parent_id": "ses_parent1",
+             "directory": "/home/u/dev/proj", "time_updated": 0},
+        ])
+
+    def _cleanup(self):
+        """Remove the temporary database directory."""
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_session_arg_resolves_to_root_and_closes(self):
+        """An explicit --session is enough to match the TUI."""
+        tui = oc_reap.Tui(1, "/home/u/dev/proj",
+                          epoch("2026-10-20T13:51:25.000"), "ses_child1", "work:0.1")
+        [decision] = oc_reap.plan([tui], [], {}, self.store,
+                                  epoch("2027-01-01T00:00:00.000"), 0)
+        self.assertEqual(decision.action, "close")
+        self.assertEqual(decision.session["id"], "ses_parent1")
+        self.assertEqual(decision.last_activity, epoch("2026-10-20T15:00:01.000"))
+
+    def test_no_mapping_is_skipped(self):
+        """No pane option, no --session and no env session: skip."""
+        tui = oc_reap.Tui(1, "/home/u/dev/proj",
+                          epoch("2026-10-20T13:51:25.000"), None, "work:0.1")
+        [decision] = oc_reap.plan([tui], [], {}, self.store,
+                                  epoch("2027-01-01T00:00:00.000"), 0)
+        self.assertEqual(decision.action, "skip")
+        self.assertIn("no session mapping", decision.reason)
+
+    def test_inherited_env_session_is_ignored(self):
+        """An env session inherited from oc-reap's own parent is not trusted."""
+        tui = oc_reap.Tui(1, "/home/u/dev/proj",
+                          epoch("2026-10-20T13:51:25.000"), None, "work:0.1",
+                          env_session="ses_parent1")
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": "ses_parent1"}):
+            [decision] = oc_reap.plan([tui], [], {}, self.store,
+                                      epoch("2027-01-01T00:00:00.000"), 0)
+        self.assertEqual(decision.action, "skip")
+
+    def test_v2_mark_wip_uses_api_once(self):
+        """The title is updated through the API and stays idempotent."""
+        self.assertEqual(self.store.mark_wip("ses_parent1"), "[WIP] Migrate module")
+        self.assertEqual(self.store.mark_wip("ses_parent1"), "[WIP] Migrate module")
+        self.assertEqual(sum(1 for call in self.store.runner.calls
+                             if call[1:3] == ["api", "patch"]), 1)
 
 
 class JournalTests(unittest.TestCase):

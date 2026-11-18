@@ -9,9 +9,11 @@ session title with ``[WIP] `` so unfinished work is easy to find again.
 ``oc-reap list`` shows the closed sessions and how to resume them.
 
 Relationships: ``ai-audit session delete`` deletes sessions and
-``ai-audit session nudge`` resumes them; this tool does neither. It
-reads the same ``opencode.log`` that ``ai-audit permissions`` reads, and
-writes only the ``title`` column through ``opencode db``.
+``ai-audit session nudge`` resumes them; this tool does neither. OpenCode 1
+matches TUIs through ``opencode.log``; OpenCode 2 maps them through the session
+exposed by the TUI (tmux pane option or ``--session``) and reads
+``session_v2`` in SQLite. Titles are written through ``opencode db`` on v1 and
+``PATCH /api/session/<id>`` on v2.
 """
 
 import argparse
@@ -24,6 +26,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -50,7 +53,7 @@ NON_TUI_SUBCOMMANDS = frozenset({
     "completion", "acp", "mcp", "attach", "run", "debug", "providers",
     "auth", "agent", "upgrade", "uninstall", "serve", "web", "models",
     "stats", "export", "import", "github", "pr", "session", "plugin",
-    "plug", "db"})
+    "plug", "db", "api", "reload", "pair", "mini"})
 SESSION_ID_RE = re.compile(r"^ses_[A-Za-z0-9]+$")
 LOG_TS_RE = re.compile(r"^timestamp=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?)Z ")
 LOG_RUN_RE = re.compile(r" run=(\S+) ")
@@ -77,6 +80,8 @@ class Tui:
     start: float
     session_arg: str | None
     tmux_target: str | None
+    pane_session: str | None = None
+    env_session: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -199,7 +204,21 @@ def boot_epoch():
     return time.time() - uptime
 
 
-def tmux_target(pid):
+def process_env(pid):
+    """Read a process environment as a bytes-to-bytes mapping.
+
+    :param pid: process id.
+    :returns: the environment mapping, or an empty dict when unreadable.
+    """
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            return dict(item.split(b"=", 1) for item in fh.read().split(b"\0")
+                        if b"=" in item)
+    except OSError:
+        return {}
+
+
+def tmux_target(pid, env=None):
     """Return the ``session:window.pane`` of the tmux pane hosting ``pid``.
 
     Best effort: reads ``TMUX``/``TMUX_PANE`` from the process environment.
@@ -207,14 +226,10 @@ def tmux_target(pid):
     cron runs with a minimal ``PATH`` and tmux may live in ``~/bin``.
 
     :param pid: process id.
+    :param env: optional environment mapping from :func:`process_env`.
     :returns: the target string, or None when unknown.
     """
-    try:
-        with open(f"/proc/{pid}/environ", "rb") as fh:
-            env = dict(item.split(b"=", 1) for item in fh.read().split(b"\0")
-                       if b"=" in item)
-    except OSError:
-        return None
+    env = process_env(pid) if env is None else env
     socket, pane = env.get(b"TMUX"), env.get(b"TMUX_PANE")
     tmux = shutil.which("tmux", path=env.get(b"PATH", b"").decode(errors="replace")) \
         or shutil.which("tmux")
@@ -227,6 +242,33 @@ def tmux_target(pid):
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None
+
+
+def tmux_pane_session(pid, env=None):
+    """Read the session id published by the oc-state plugin on this pane.
+
+    :param pid: process id.
+    :param env: optional environment mapping from :func:`process_env`.
+    :returns: a validated ``ses_*`` id, or None.
+    """
+    env = process_env(pid) if env is None else env
+    socket, pane = env.get(b"TMUX"), env.get(b"TMUX_PANE")
+    tmux = shutil.which("tmux", path=env.get(b"PATH", b"").decode(errors="replace")) \
+        or shutil.which("tmux")
+    if not socket or not pane or not tmux:
+        return None
+    result = subprocess.run(
+        [tmux, "-S", socket.split(b",")[0].decode(), "show-options", "-p",
+         "-t", pane.decode(), "@oc_session_id"],
+        capture_output=True, text=True, check=False, timeout=5)
+    if result.returncode != 0:
+        return None
+    line = result.stdout.strip()
+    if not line:
+        return None
+    _, _, raw = line.partition(" ")
+    value = raw.strip().strip('"')
+    return value if SESSION_ID_RE.match(value) else None
 
 
 def find_tuis(exclude=()):
@@ -256,8 +298,13 @@ def find_tuis(exclude=()):
             cwd = os.readlink(f"/proc/{pid}/cwd")
         except (OSError, IndexError, ValueError):
             continue  # process vanished or unreadable
+        env = process_env(pid)
+        env_session = env.get(b"OPENCODE_SESSION_ID", b"").decode(errors="replace")
+        if not SESSION_ID_RE.match(env_session):
+            env_session = None
         tuis.append(Tui(pid, cwd, boot + start_ticks / hertz, session,
-                        tmux_target(pid)))
+                        tmux_target(pid, env), tmux_pane_session(pid, env),
+                        env_session))
     return tuis
 
 
@@ -280,6 +327,8 @@ def match_run(tui, instances):
 
 class OpencodeDb:
     """Minimal access to opencode's session table through ``opencode db``."""
+
+    schema = "v1"
 
     def __init__(self, binary, runner=subprocess.run):
         """Store the opencode binary path and the subprocess runner.
@@ -366,6 +415,199 @@ class OpencodeDb:
         return after["title"]
 
 
+class V2SessionStore:
+    """OpenCode 2 session access: read-only SQLite and API title updates.
+
+    OpenCode 2 removed ``opencode db``. Session rows live in the SQLite
+    database (``session_v2`` table) and titles are updated through the
+    running server's ``PATCH /api/session/<id>`` endpoint.
+    """
+
+    schema = "v2"
+
+    def __init__(self, binary, runner=subprocess.run, db_path=None):
+        """Resolve the v2 database and keep the binary for API calls.
+
+        :param binary: path to the ``opencode`` executable.
+        :param runner: callable compatible with :func:`subprocess.run`.
+        :param db_path: explicit database path (tests).
+        """
+        self.binary = binary
+        self.runner = runner
+        self.db_path = db_path or default_db_path(binary, runner)
+
+    def query(self, sql, params=()):
+        """Run a read-only SQL query and return dict rows.
+
+        :param sql: statement using ``?`` placeholders only.
+        :param params: statement parameters.
+        :returns: list of dict rows.
+        :raises ReapError: when the database cannot be opened or queried.
+        """
+        try:
+            con = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            raise ReapError(f"cannot open opencode database {self.db_path}: {exc}") from exc
+        try:
+            con.row_factory = sqlite3.Row
+            return [dict(row) for row in con.execute(sql, params)]
+        except sqlite3.Error as exc:
+            raise ReapError(f"opencode database query failed: {exc}") from exc
+        finally:
+            con.close()
+
+    def session(self, session_id):
+        """Return one v2 session row, or None when it does not exist.
+
+        :param session_id: an ``ses_*`` id.
+        :raises ReapError: on an invalid id or several rows.
+        """
+        if not SESSION_ID_RE.match(session_id):
+            raise ReapError(f"invalid session id {session_id!r}")
+        rows = self.query(
+            "SELECT id, title, parent_id, directory, time_updated, "
+            "time_busy, time_viewed, time_idle FROM session_v2 WHERE id = ?",
+            (session_id,))
+        if len(rows) > 1:
+            raise ReapError(f"{len(rows)} rows for session {session_id}")
+        if rows and "title" not in rows[0]:
+            raise ReapError("unexpected session schema: no 'title' column")
+        return rows[0] if rows else None
+
+    def root_session(self, session_id):
+        """Follow ``parent_id`` up to the top-level session."""
+        seen = set()
+        row = self.session(session_id)
+        while row and row.get("parent_id") and row["id"] not in seen:
+            seen.add(row["id"])
+            row = self.session(row["parent_id"])
+        return row
+
+    def mark_wip(self, session_id):
+        """Prefix the title through the v2 server API (idempotent).
+
+        :param session_id: the session to tag.
+        :returns: the new title.
+        :raises ReapError: when the API call fails or the update did not stick.
+        """
+        before = self.session(session_id)
+        if before is None:
+            raise ReapError(f"session {session_id} not found")
+        if not before["title"].startswith(WIP_PREFIX):
+            payload = json.dumps({"title": WIP_PREFIX + before["title"]})
+            result = self.runner(
+                [self.binary, "api", "patch", f"/api/session/{session_id}",
+                 "--data", payload],
+                capture_output=True, text=True, check=False, timeout=60)
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()[:300]
+                raise ReapError(f"opencode api patch failed ({result.returncode}): {detail}")
+        after = self.session(session_id)
+        if after is None or not after["title"].startswith(WIP_PREFIX):
+            raise ReapError(f"title of {session_id} was not updated")
+        return after["title"]
+
+
+def default_db_path(binary, runner=subprocess.run):
+    """Return the v2 database path reported by ``opencode debug paths``.
+
+    :param binary: path to the ``opencode`` executable.
+    :param runner: callable compatible with :func:`subprocess.run`.
+    :returns: absolute database path.
+    """
+    result = runner([binary, "debug", "paths"], capture_output=True, text=True,
+                    check=False, timeout=30)
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.startswith("db "):
+                return line.split(None, 1)[1].strip()
+    explicit = os.environ.get("OPENCODE_DB")
+    if explicit:
+        return explicit
+    return os.path.expanduser("~/.local/share/opencode/opencode.db")
+
+
+def build_store(binary, runner=subprocess.run):
+    """Select the session store matching the installed opencode version.
+
+    :param binary: path to the ``opencode`` executable.
+    :param runner: callable compatible with :func:`subprocess.run`.
+    :returns: :class:`V2SessionStore` for opencode 2, otherwise
+        :class:`OpencodeDb`.
+    """
+    result = runner([binary, "--version"], capture_output=True, text=True,
+                    check=False, timeout=30)
+    text = (result.stdout or "") + (result.stderr or "")
+    match = re.search(r"\bv(\d+)\.", text)
+    if match and int(match.group(1)) >= 2:
+        return V2SessionStore(binary, runner)
+    return OpencodeDb(binary, runner)
+
+
+def session_activity_epochs(session):
+    """Collect session activity timestamps (epoch seconds) from a v2 row.
+
+    :param session: a session dict.
+    :returns: list of epoch seconds from non-null millisecond fields.
+    """
+    values = []
+    for key in ("time_updated", "time_busy", "time_viewed", "time_idle"):
+        value = session.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            values.append(value / 1000)
+    return values
+
+
+def decide_v2(tui, session, now, threshold):
+    """Compute the decision for one TUI using a v2 session row.
+
+    Last activity is the most recent of the TUI start and the session's
+    activity fields. No log markers are involved: opencode 2 no longer logs
+    ``creating instance`` or ``session.id=``.
+    """
+    candidates = [tui.start, *session_activity_epochs(session)]
+    last = max(candidates)
+    idle = now - last
+    if idle < threshold:
+        return Decision(tui, "keep", f"active {format_age(idle)} ago",
+                        None, session, last)
+    return Decision(tui, "close", f"idle for {format_age(idle)}",
+                    None, session, last)
+
+
+def locate_session(tui, db):
+    """Find the unique session displayed by a v2 TUI.
+
+    Priority: the oc-state tmux option (authoritative), then an explicit
+    ``--session`` argument, then ``$OPENCODE_SESSION_ID`` only when it is not
+    inherited from oc-reap's own session and its directory matches the TUI.
+
+    :param tui: the :class:`Tui`.
+    :param db: a :class:`V2SessionStore`.
+    :returns: ``(session, None)`` on success, ``(None, reason)`` otherwise.
+    """
+    mapped = [value for value in (tui.pane_session, tui.session_arg) if value]
+    if len(set(mapped)) > 1:
+        return None, "ambiguous: tmux pane option and --session disagree"
+    if mapped:
+        session_id = mapped[0]
+    elif tui.env_session and tui.env_session != os.environ.get("OPENCODE_SESSION_ID"):
+        session_id = tui.env_session
+    else:
+        return None, "no session mapping (tmux pane option or --session)"
+    if not SESSION_ID_RE.match(session_id):
+        return None, f"invalid session id {session_id!r}"
+    row = db.session(session_id)
+    if row is None:
+        return None, f"session {session_id} not found"
+    if session_id == tui.env_session and row.get("directory") != tui.cwd:
+        return None, "environment session does not match the TUI directory"
+    root = db.root_session(session_id)
+    if root is None:
+        return None, f"root session for {session_id} not found"
+    return root, None
+
+
 def decide(tui, run, activity, session, now, threshold):
     """Compute the decision for one TUI (pure function).
 
@@ -397,10 +639,20 @@ def decide(tui, run, activity, session, now, threshold):
 def plan(tuis, instances, activity, db, now, threshold):
     """Build the list of decisions for all TUIs.
 
+    OpenCode 1 is matched through log runs; OpenCode 2 is matched through the
+    session exposed by the TUI (tmux pane option or ``--session``).
+
     :returns: list of :class:`Decision`.
     """
     decisions = []
     for tui in sorted(tuis, key=lambda t: t.start):
+        if getattr(db, "schema", "v1") == "v2":
+            session, problem = locate_session(tui, db)
+            if session is None:
+                decisions.append(Decision(tui, "skip", problem))
+                continue
+            decisions.append(decide_v2(tui, session, now, threshold))
+            continue
         run, problem = match_run(tui, instances)
         if run is None:
             decisions.append(Decision(tui, "skip", problem))
@@ -415,9 +667,9 @@ def plan(tuis, instances, activity, db, now, threshold):
 def terminate(pid, timeout=TERM_TIMEOUT_S):
     """Stop a TUI with SIGTERM and wait for it to exit.
 
-    SIGTERM was verified on opencode 1.19.3 to exit cleanly (status 0),
-    stop the MCP child processes and keep the session resumable. No
-    SIGKILL escalation: a TUI that ignores SIGTERM is reported instead.
+    SIGTERM was verified on opencode 1.19.3 and 2.3.2 to exit cleanly
+    (status 0), stop the MCP child processes and keep the session resumable.
+    No SIGKILL escalation: a TUI that ignores SIGTERM is reported instead.
 
     :param pid: process id.
     :param timeout: seconds to wait.
@@ -570,9 +822,7 @@ def cmd_reap(args, out):
     :returns: exit code.
     """
     threshold = parse_duration(args.older_than)
-    if not os.path.exists(args.log):
-        raise ReapError(f"log file not found: {args.log}")
-    db = OpencodeDb(find_opencode(args.opencode))
+    db = build_store(find_opencode(args.opencode))
     os.makedirs(args.state_dir, exist_ok=True)
     with open(os.path.join(args.state_dir, LOCK_NAME), "w") as lock:
         try:
@@ -582,8 +832,13 @@ def cmd_reap(args, out):
         tuis = find_tuis(exclude=ancestors())
         if args.pid:
             tuis = [t for t in tuis if t.pid in set(args.pid)]
-        with open(args.log, encoding="utf-8", errors="replace") as fh:
-            instances, activity = parse_log(fh)
+        if db.schema == "v1":
+            if not os.path.exists(args.log):
+                raise ReapError(f"log file not found: {args.log}")
+            with open(args.log, encoding="utf-8", errors="replace") as fh:
+                instances, activity = parse_log(fh)
+        else:
+            instances, activity = [], {}
         now = time.time()
         decisions = plan(tuis, instances, activity, db, now, threshold)
         failures = 0
@@ -647,7 +902,7 @@ def cmd_list(args, out, db=None):
         if record.get("session_id"):
             latest[record["session_id"]] = record
     if latest and db is None:
-        db = OpencodeDb(find_opencode(args.opencode))
+        db = build_store(find_opencode(args.opencode))
     rows = []
     for record in sorted(latest.values(), key=lambda r: r["timestamp"], reverse=True):
         current = db.session(record["session_id"])

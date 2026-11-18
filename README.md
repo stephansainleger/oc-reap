@@ -13,25 +13,37 @@ in opencode's database and can be resumed at any time.
 
 For every opencode TUI owned by the current user:
 
-1. Identify its log run: the `creating instance` line of
-   `~/.local/share/opencode/log/opencode.log` with the same working
-   directory, within 120 s of the process start. No match, or several
-   matches: the TUI is **skipped**, never closed.
+1. Match it to exactly one session:
+   - **OpenCode 1**: the `creating instance` line of
+     `~/.local/share/opencode/log/opencode.log` with the same working
+     directory, within 120 s of the process start.
+   - **OpenCode 2**: the session published by the `oc-state` plugin on the
+     tmux pane (`@oc_session_id`), then an explicit `--session`, then
+     `$OPENCODE_SESSION_ID` only when it is not inherited from oc-reap's own
+     session and matches the TUI directory.
+
+   No match, or several matches: the TUI is **skipped**, never closed.
 2. Compute its last activity: the most recent of the process start, the
-   last log line of that run carrying a `session.id=` (agent loop, LLM
-   stream, tool call), and the session's `time_updated`. Maintenance log
-   lines (file watcher, project refresh) are ignored.
+   session's `time_updated`, `time_busy`, `time_viewed` and `time_idle`
+   (v2), and, on v1, the last `session.id=` line of the run.
 3. If idle longer than the threshold: send `SIGTERM` (verified on opencode
-   1.19.3: clean exit, MCP children stopped, session resumable), wait up
-   to 15 s, never escalate to `SIGKILL`.
+   1.19.3 and 2.3.2: clean exit, MCP children stopped, session resumable),
+   wait up to 15 s, never escalate to `SIGKILL`.
 4. Prefix the session title with `[WIP] ` (once; sub-agent activity is
-   resolved to the top-level session). Only the `title` column changes,
-   through `opencode db`; `time_updated` is kept so the session list order
-   does not change.
+   resolved to the top-level session). Only the title changes:
+   `opencode db` on v1, `PATCH /api/session/<id>` on v2; `time_updated` is
+   kept so the session list order does not change.
 5. Append a record to `~/.local/state/oc-reap/closed.jsonl` and to syslog
    (`journalctl -t oc-reap`).
 
 The TUI that runs `oc-reap` (and its ancestors) is never considered.
+
+## Requirements
+
+- OpenCode 1 or 2.
+- For OpenCode 2 matching without `--session`, the `oc-state` plugin (from
+  `ocjump`) must publish `@oc_session_id` on the TUI's tmux pane; otherwise
+  that TUI is skipped safely.
 
 ## Usage
 
@@ -77,7 +89,7 @@ Example (`list`):
 | `--older-than DURATION` | reap | idle threshold: `72h` (default), `3d`, `90m`, `0s` |
 | `-n`, `--dry-run` | reap | print decisions only |
 | `--pid PID` | reap | only consider this TUI (repeatable) |
-| `--log PATH` | reap | opencode log (default `~/.local/share/opencode/log/opencode.log`) |
+| `--log PATH` | reap | opencode v1 log (default `~/.local/share/opencode/log/opencode.log`; unused on v2) |
 | `-a`, `--all` | list | include sessions whose `[WIP] ` prefix was removed |
 | `--state-dir DIR` | both | journal directory (default `$XDG_STATE_HOME/oc-reap`) |
 | `--opencode PATH` | both | opencode executable (also `$OC_REAP_OPENCODE`) |
@@ -91,7 +103,7 @@ Exit codes: `0` success, `1` error (including a TUI that ignored
 
 `reap --json`: `timestamp`, `pid`, `action` (`close`, `closed`, `keep`,
 `skip`, `error`), `reason`, `last_activity`, `tmux`, `directory`,
-`session_id`, `title`, `run`.
+`session_id`, `title`, `run`. `run` is the v1 log run id and is `null` on v2.
 
 `list --json` (journal record plus current state): `timestamp`, `pid`,
 `tmux`, `directory`, `session_id`, `title` (current), `last_activity`,

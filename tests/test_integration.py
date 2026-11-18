@@ -67,29 +67,39 @@ class RealTuiTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Import a throwaway session (no LLM call involved)."""
+        """Create a throwaway session (no LLM call involved)."""
         cls.opencode = oc_reap.find_opencode(None)
+        cls.db = oc_reap.build_store(cls.opencode)
+        cls.v2 = cls.db.schema == "v2"
         cls.tmp = tempfile.mkdtemp(prefix="oc-reap-it-")
-        # `opencode import` stamps the session with its working directory.
         cls.project = os.path.join(cls.tmp, "project")
-        # The TUI runs from another directory so that the import process
-        # never makes the run matching ambiguous.
         cls.tui_dir = os.path.join(cls.tmp, "tui")
         cls.state = os.path.join(cls.tmp, "state")
         for path in (cls.project, cls.tui_dir):
             os.makedirs(path)
         cls.addClassCleanup(shutil.rmtree, cls.tmp, ignore_errors=True)
-        fixture = os.path.join(cls.tmp, "session.json")
-        cls.session_id = fresh_fixture(fixture)
-        subprocess.run([cls.opencode, "import", fixture], cwd=cls.project,
-                       stdin=subprocess.DEVNULL, capture_output=True, check=True,
-                       timeout=120)
+        if cls.v2:
+            created = subprocess.run(
+                [cls.opencode, "api", "post", "/api/session", "--data",
+                 json.dumps({"title": TITLE})],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                check=False, timeout=60)
+            payload = json.loads(created.stdout) if created.stdout.strip() else {}
+            cls.session_id = (payload.get("data") or {}).get("id")
+            assert cls.session_id, created.stdout + created.stderr
+        else:
+            fixture = os.path.join(cls.tmp, "session.json")
+            cls.session_id = fresh_fixture(fixture)
+            subprocess.run([cls.opencode, "import", fixture], cwd=cls.project,
+                           stdin=subprocess.DEVNULL, capture_output=True, check=True,
+                           timeout=120)
         cls.addClassCleanup(subprocess.run, [cls.opencode, "session", "delete",
                                              cls.session_id],
                             capture_output=True, check=False, timeout=60)
-        cls.db = oc_reap.OpencodeDb(cls.opencode)
         row = cls.db.session(cls.session_id)
-        assert row and row["title"] == TITLE and row["directory"] == cls.project, row
+        assert row and row["title"] == TITLE, row
+        if not cls.v2:
+            assert row["directory"] == cls.project, row
 
     def tmux(self, *args):
         """Run tmux against the isolated server with a pinned environment."""
@@ -111,9 +121,11 @@ class RealTuiTests(unittest.TestCase):
                     return t.pid
             return None
         pid = wait_for(find, 30, "the TUI process")
-        # Wait for the "creating instance" log line of this TUI.
-        wait_for(lambda: self.run_reap("--dry-run", pid=pid)[1].count("skip") == 0,
-                 30, "the TUI instance in the log")
+        if not self.v2:
+            # V1 matches the "creating instance" log line; V2 uses the session
+            # exposed by --session / the tmux pane option.
+            wait_for(lambda: self.run_reap("--dry-run", pid=pid)[1].count("skip") == 0,
+                     30, "the TUI instance in the log")
         return pid
 
     def cleanup_tmux(self):
@@ -153,8 +165,9 @@ class RealTuiTests(unittest.TestCase):
 
         [record] = oc_reap.read_journal(self.state)
         self.assertEqual(record["session_id"], self.session_id)
+        session_dir = self.db.session(self.session_id)["directory"]
         self.assertEqual(record["resume"],
-                         f"cd {self.project} && opencode --session {self.session_id}")
+                         oc_reap.resume_command(session_dir, self.session_id))
 
         out = io.StringIO()
         oc_reap.main(["list", "--state-dir", self.state, "--json"], out=out)
@@ -169,9 +182,10 @@ class RealTuiTests(unittest.TestCase):
         rc, _ = self.run_reap(pid=pid)
         self.assertEqual(rc, 0)
         self.assertEqual(self.title(), oc_reap.WIP_PREFIX + TITLE)
-        messages = self.db.query("SELECT count(*) AS n FROM message WHERE "
-                                 f"session_id = '{self.session_id}'")
-        self.assertGreaterEqual(messages[0]["n"], 2)
+        if not self.v2:
+            messages = self.db.query("SELECT count(*) AS n FROM message WHERE "
+                                     f"session_id = '{self.session_id}'")
+            self.assertGreaterEqual(messages[0]["n"], 2)
 
 
 if __name__ == "__main__":
